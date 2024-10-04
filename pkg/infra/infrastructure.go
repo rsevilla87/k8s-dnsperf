@@ -6,26 +6,35 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/ptr"
 )
 
-func NewInfra(uuid string) (Infra, error) {
-	clientSet, err := newClientSet()
+func NewInfra(uuid, selector string, records int, recordType RecordType) (Infra, error) {
+	clientSet, restConfig, err := newClientSet()
 	if err != nil {
 		return Infra{}, err
 	}
 	return Infra{
-		ClientSet: clientSet,
-		UUID:      uuid,
+		ClientSet:  clientSet,
+		RestConfig: restConfig,
+		UUID:       uuid,
+		Selector:   selector,
+		Records:    records,
+		RecordType: recordType,
 	}, nil
 }
 
-func newClientSet() (*kubernetes.Clientset, error) {
+func newClientSet() (*kubernetes.Clientset, *rest.Config, error) {
 	var kubeconfig string
 	if os.Getenv("KUBECONFIG") != "" {
 		kubeconfig = os.Getenv("KUBECONFIG")
@@ -33,48 +42,92 @@ func newClientSet() (*kubernetes.Clientset, error) {
 		kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
 	}
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	restConfig.QPS = 200
+	restConfig.Burst = 200
 	if err != nil {
-		return nil, err
+		return nil, restConfig, err
 	}
-	return kubernetes.NewForConfigOrDie(restConfig), nil
+	return kubernetes.NewForConfigOrDie(restConfig), restConfig, nil
 }
 
 func (i *Infra) Deploy() error {
-	fmt.Printf("Creating required infrastructure")
-	_, err := i.ClientSet.CoreV1().Namespaces().Create(context.TODO(), &namespace, metav1.CreateOptions{})
+	log.Info().Msg("Creating benchmark assets")
+	nodeSelector, err := labels.ConvertSelectorToLabelsMap(i.Selector)
 	if err != nil {
-		return fmt.Errorf("failed to create Namespace: %w", err)
-	}
-	_, err = i.ClientSet.AppsV1().DaemonSets(namespace.Name).Create(context.TODO(), &dnsPerfDS, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to create DaemonSet: %w", err)
-	}
-	if err := waitForDS(i.ClientSet); err != nil {
 		return err
 	}
-	return nil
+	dnsPerfDS.Spec.Template.Spec.NodeSelector = nodeSelector
+	_, err = i.ClientSet.CoreV1().Namespaces().Create(context.TODO(), &namespace, metav1.CreateOptions{})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create Namespace: %w", err)
+	}
+	for j := 1; j < i.Records; j++ {
+		// TODO Use goroutines to create services faster
+		service.Name = fmt.Sprintf("%s-%d", K8sDNSPerf, j)
+		_, err := i.ClientSet.CoreV1().Services(namespace.Name).Create(context.TODO(), &service, metav1.CreateOptions{})
+		if err != nil && !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create Service: %w", err)
+		}
+	}
+	_, err = i.ClientSet.AppsV1().DaemonSets(namespace.Name).Create(context.TODO(), &dnsPerfDS, metav1.CreateOptions{})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create DaemonSet: %w", err)
+	}
+	if i.ClientPods, err = waitForDS(i.ClientSet); err != nil {
+		return err
+	}
+	i.Services, err = i.ClientSet.CoreV1().Services(K8sDNSPerf).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", K8sDNSPerf),
+	})
+	if err != nil {
+		return err
+	}
+	recordsCM.Data["records"] = i.genRecords()
+	_, err = i.ClientSet.CoreV1().ConfigMaps(K8sDNSPerf).Create(context.TODO(), &recordsCM, metav1.CreateOptions{})
+	return err
 }
 
 func (i *Infra) Destroy() error {
-	fmt.Printf("Destroying required infrastructure")
+	log.Info().Msg("Destroying benchmark assets")
 	err := i.ClientSet.CoreV1().Namespaces().Delete(context.TODO(), namespace.Name, metav1.DeleteOptions{})
 	return err
 }
 
-func waitForDS(clientSet *kubernetes.Clientset) error {
-	fmt.Printf("Waiting for DaemonSet %s/%s pods to be running\n", namespace.Name, dnsPerfDS.Name)
+func waitForDS(clientSet *kubernetes.Clientset) (*corev1.PodList, error) {
+	var podList *corev1.PodList
+	log.Info().Msgf("Waiting for DaemonSet %s/%s pods to be running", namespace.Name, dnsPerfDS.Name)
+	ds, err := clientSet.AppsV1().DaemonSets(namespace.Name).Get(context.TODO(), dnsPerfDS.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if ds.Status.NumberReady == ds.Status.DesiredNumberScheduled {
+		return nil, err
+	}
+	// TODO handle timeout
 	watcher, err := clientSet.AppsV1().DaemonSets(namespace.Name).Watch(context.TODO(), metav1.ListOptions{TimeoutSeconds: ptr.To[int64](60)})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for event := range watcher.ResultChan() {
 		ds := event.Object.(*appsv1.DaemonSet)
 		if event.Type == watch.Modified {
 			if ds.Status.NumberReady == ds.Status.DesiredNumberScheduled {
 				watcher.Stop()
-				return nil
+				break
 			}
 		}
 	}
-	return nil
+	podList, err = clientSet.CoreV1().Pods(namespace.Name).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", K8sDNSPerf),
+	})
+	return podList, err
+}
+
+func (i *Infra) genRecords() string {
+	var records string
+	records += fmt.Sprintf("kubernetes.default.svc.cluster.local %s\n", i.RecordType)
+	for _, svc := range i.Services.Items {
+		records += fmt.Sprintf("%s.%s.svc.cluster.local %s\n", svc.Name, svc.Namespace, i.RecordType)
+	}
+	return records
 }
