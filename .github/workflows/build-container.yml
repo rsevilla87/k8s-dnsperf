@@ -1,4 +1,4 @@
-name: Release ingress-perf container image
+name: Release k8s-dnsperf container image
 
 on:
   push:
@@ -11,7 +11,7 @@ env:
 
 jobs:
   build-and-publish-container-images:
-    name: Build and Publish Multi Architecture Container Images
+    name: Build and publish multi-arch container images
     runs-on: ubuntu-latest
 
     permissions:
