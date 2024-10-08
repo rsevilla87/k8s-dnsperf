@@ -28,15 +28,15 @@ $(BIN_PATH): $(SOURCES)
 	GOARCH=$(shell go env GOARCH) CGO_ENABLED=$(CGO) go build -v -ldflags "-X $(K8S_DNSPERF_VERSION).GitCommit=$(GIT_COMMIT) -X $(K8S_DNSPERF_VERSION).Version=$(VERSION) -X $(K8S_DNSPERF_VERSION).BuildDate=$(BUILD_DATE)" -o $(BIN_PATH) cmd/k8s-dnsperf.go
 
 container-build:
-	@echo "Building the container image"
+	@echo "Building container image"
 	$(CONTAINER_BUILD) -f containers/Containerfile -t $(CONTAINER_NS)/$(BIN_NAME) ./containers
 
-gha-build:
+manifest:
 	@echo "Building container images"
 	$(CONTAINER_BUILD) --jobs=2 -f containers/Containerfile --platform=linux/amd64,linux/arm64,linux/ppc64le ./containers --manifest=$(CONTAINER_NS)/$(BIN_NAME):latest
 
-gha-push: gha-build
-	@echo "Publish the Container Images"
+push-manifest: manifest
+	@echo "Publishing containers"
 	podman manifest push $(CONTAINER_NS)/$(BIN_NAME):latest $(CONTAINER_NS)/$(BIN_NAME):latest
 
 clean:

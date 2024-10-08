@@ -7,6 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 )
 
 const K8sDNSPerf = "k8s-dnsperf"
@@ -68,10 +69,30 @@ var dnsPerfDS = appsv1.DaemonSet{
 				},
 			},
 			Spec: corev1.PodSpec{
+				TerminationGracePeriodSeconds: ptr.To[int64](0),
 				Containers: []corev1.Container{
 					{
 						Name:  K8sDNSPerf,
 						Image: "quay.io/cloud-bulldozer/k8s-dnsperf:latest",
+						VolumeMounts: []corev1.VolumeMount{
+							{
+								Name:      "dnsperf-records",
+								MountPath: "/records",
+								SubPath:   "records",
+							},
+						},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "dnsperf-records",
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "dnsperf-records",
+								},
+							},
+						},
 					},
 				},
 			},

@@ -19,12 +19,13 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-func NewInfra(uuid, selector string, records int, recordType RecordType) (Infra, error) {
+// Creates a new infra instance
+func NewInfra(uuid, selector string, records int, recordType RecordType) (*Infra, error) {
 	clientSet, restConfig, err := newClientSet()
 	if err != nil {
-		return Infra{}, err
+		return &Infra{}, err
 	}
-	return Infra{
+	return &Infra{
 		ClientSet:  clientSet,
 		RestConfig: restConfig,
 		UUID:       uuid,
@@ -50,31 +51,27 @@ func newClientSet() (*kubernetes.Clientset, *rest.Config, error) {
 	return kubernetes.NewForConfigOrDie(restConfig), restConfig, nil
 }
 
+// Deploy k8s-dnsperf assets
 func (i *Infra) Deploy() error {
-	log.Info().Msg("Creating benchmark assets")
+	log.Info().Msg("Creating benchmark assets 🚧")
 	nodeSelector, err := labels.ConvertSelectorToLabelsMap(i.Selector)
 	if err != nil {
 		return err
 	}
 	dnsPerfDS.Spec.Template.Spec.NodeSelector = nodeSelector
+	log.Debug().Msgf("Creating namespace: %s", namespace.Name)
 	_, err = i.ClientSet.CoreV1().Namespaces().Create(context.TODO(), &namespace, metav1.CreateOptions{})
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create Namespace: %w", err)
 	}
+	log.Debug().Msgf("Creating %d services", i.Records)
 	for j := 1; j < i.Records; j++ {
 		// TODO Use goroutines to create services faster
 		service.Name = fmt.Sprintf("%s-%d", K8sDNSPerf, j)
 		_, err := i.ClientSet.CoreV1().Services(namespace.Name).Create(context.TODO(), &service, metav1.CreateOptions{})
-		if err != nil && !errors.IsAlreadyExists(err) {
+		if err != nil {
 			return fmt.Errorf("failed to create Service: %w", err)
 		}
-	}
-	_, err = i.ClientSet.AppsV1().DaemonSets(namespace.Name).Create(context.TODO(), &dnsPerfDS, metav1.CreateOptions{})
-	if err != nil && !errors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create DaemonSet: %w", err)
-	}
-	if i.ClientPods, err = waitForDS(i.ClientSet); err != nil {
-		return err
 	}
 	i.Services, err = i.ClientSet.CoreV1().Services(K8sDNSPerf).List(context.TODO(), metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("app=%s", K8sDNSPerf),
@@ -83,12 +80,23 @@ func (i *Infra) Deploy() error {
 		return err
 	}
 	recordsCM.Data["records"] = i.genRecords()
+	log.Debug().Msgf("Creating ConfigMap: %s", recordsCM.Name)
 	_, err = i.ClientSet.CoreV1().ConfigMaps(K8sDNSPerf).Create(context.TODO(), &recordsCM, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create ConfigMap: %w", err)
+	}
+	log.Debug().Msgf("Creating DaemonSet: %s", dnsPerfDS.Name)
+	_, err = i.ClientSet.AppsV1().DaemonSets(namespace.Name).Create(context.TODO(), &dnsPerfDS, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create DaemonSet: %w", err)
+	}
+	i.ClientPods, err = waitForDS(i.ClientSet)
 	return err
 }
 
+// Destroy k8s-dnsperf assets
 func (i *Infra) Destroy() error {
-	log.Info().Msg("Destroying benchmark assets")
+	log.Info().Msg("Destroying benchmark assets 💥")
 	err := i.ClientSet.CoreV1().Namespaces().Delete(context.TODO(), namespace.Name, metav1.DeleteOptions{})
 	return err
 }
