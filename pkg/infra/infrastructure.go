@@ -74,7 +74,7 @@ func (i *Infra) Deploy() error {
 		}
 	}
 	i.Services, err = i.ClientSet.CoreV1().Services(K8sDNSPerf).List(context.TODO(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", K8sDNSPerf),
+		LabelSelector: fmt.Sprint("app=" + K8sDNSPerf),
 	})
 	if err != nil {
 		return err
@@ -126,7 +126,7 @@ func waitForDS(clientSet *kubernetes.Clientset) (*corev1.PodList, error) {
 		}
 	}
 	podList, err = clientSet.CoreV1().Pods(namespace.Name).List(context.TODO(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", K8sDNSPerf),
+		LabelSelector: fmt.Sprint("app=" + K8sDNSPerf),
 	})
 	return podList, err
 }
