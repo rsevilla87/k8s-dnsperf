@@ -10,6 +10,11 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+const (
+	QPS   = 100
+	Burst = 100
+)
+
 const K8sDNSPerf = "k8s-dnsperf"
 
 type RecordType string

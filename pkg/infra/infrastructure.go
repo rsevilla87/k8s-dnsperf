@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/rs/zerolog/log"
+	"golang.org/x/time/rate"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -43,8 +44,8 @@ func newClientSet() (*kubernetes.Clientset, *rest.Config, error) {
 		kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
 	}
 	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	restConfig.QPS = 200
-	restConfig.Burst = 200
+	restConfig.QPS = QPS
+	restConfig.Burst = Burst
 	if err != nil {
 		return nil, restConfig, err
 	}
@@ -53,6 +54,7 @@ func newClientSet() (*kubernetes.Clientset, *rest.Config, error) {
 
 // Deploy k8s-dnsperf assets
 func (i *Infra) Deploy() error {
+	limiter := rate.NewLimiter(QPS, Burst)
 	log.Info().Msg("Creating benchmark assets 🚧")
 	nodeSelector, err := labels.ConvertSelectorToLabelsMap(i.Selector)
 	if err != nil {
@@ -66,12 +68,14 @@ func (i *Infra) Deploy() error {
 	}
 	log.Debug().Msgf("Creating %d services", i.Records)
 	for j := 1; j < i.Records; j++ {
-		// TODO Use goroutines to create services faster
 		service.Name = fmt.Sprintf("%s-%d", K8sDNSPerf, j)
-		_, err := i.ClientSet.CoreV1().Services(namespace.Name).Create(context.TODO(), &service, metav1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create Service: %w", err)
-		}
+		go func(svc corev1.Service) {
+			limiter.Wait(context.TODO())
+			_, err := i.ClientSet.CoreV1().Services(namespace.Name).Create(context.TODO(), &svc, metav1.CreateOptions{})
+			if err != nil {
+				log.Fatal().Msgf("failed to create Service: %v", err)
+			}
+		}(service)
 	}
 	i.Services, err = i.ClientSet.CoreV1().Services(K8sDNSPerf).List(context.TODO(), metav1.ListOptions{
 		LabelSelector: "app=" + K8sDNSPerf,
