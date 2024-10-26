@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"golang.org/x/time/rate"
@@ -54,6 +56,9 @@ func newClientSet() (*kubernetes.Clientset, *rest.Config, error) {
 
 // Deploy k8s-dnsperf assets
 func (i *Infra) Deploy() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	wg := sync.WaitGroup{}
 	limiter := rate.NewLimiter(QPS, Burst)
 	log.Info().Msg("Creating benchmark assets 🚧")
 	nodeSelector, err := labels.ConvertSelectorToLabelsMap(i.Selector)
@@ -62,22 +67,25 @@ func (i *Infra) Deploy() error {
 	}
 	dnsPerfDS.Spec.Template.Spec.NodeSelector = nodeSelector
 	log.Debug().Msgf("Creating namespace: %s", namespace.Name)
-	_, err = i.ClientSet.CoreV1().Namespaces().Create(context.TODO(), &namespace, metav1.CreateOptions{})
+	_, err = i.ClientSet.CoreV1().Namespaces().Create(ctx, &namespace, metav1.CreateOptions{})
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create Namespace: %w", err)
 	}
 	log.Debug().Msgf("Creating %d services", i.Records)
 	for j := 1; j < i.Records; j++ {
 		service.Name = fmt.Sprintf("%s-%d", K8sDNSPerf, j)
+		wg.Add(1)
 		go func(svc corev1.Service) {
-			limiter.Wait(context.TODO())
-			_, err := i.ClientSet.CoreV1().Services(namespace.Name).Create(context.TODO(), &svc, metav1.CreateOptions{})
+			defer wg.Done()
+			limiter.Wait(ctx)
+			_, err := i.ClientSet.CoreV1().Services(namespace.Name).Create(ctx, &svc, metav1.CreateOptions{})
 			if err != nil {
 				log.Fatal().Msgf("failed to create Service: %v", err)
 			}
 		}(service)
 	}
-	i.Services, err = i.ClientSet.CoreV1().Services(K8sDNSPerf).List(context.TODO(), metav1.ListOptions{
+	wg.Wait()
+	i.Services, err = i.ClientSet.CoreV1().Services(K8sDNSPerf).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=" + K8sDNSPerf,
 	})
 	if err != nil {
@@ -85,16 +93,16 @@ func (i *Infra) Deploy() error {
 	}
 	recordsCM.Data["records"] = i.genRecords()
 	log.Debug().Msgf("Creating ConfigMap: %s", recordsCM.Name)
-	_, err = i.ClientSet.CoreV1().ConfigMaps(K8sDNSPerf).Create(context.TODO(), &recordsCM, metav1.CreateOptions{})
+	_, err = i.ClientSet.CoreV1().ConfigMaps(K8sDNSPerf).Create(ctx, &recordsCM, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to create ConfigMap: %w", err)
 	}
 	log.Debug().Msgf("Creating DaemonSet: %s", dnsPerfDS.Name)
-	_, err = i.ClientSet.AppsV1().DaemonSets(namespace.Name).Create(context.TODO(), &dnsPerfDS, metav1.CreateOptions{})
+	_, err = i.ClientSet.AppsV1().DaemonSets(namespace.Name).Create(ctx, &dnsPerfDS, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to create DaemonSet: %w", err)
 	}
-	i.ClientPods, err = waitForDS(i.ClientSet)
+	i.ClientPods, err = waitForDS(ctx, i.ClientSet)
 	return err
 }
 
@@ -105,7 +113,7 @@ func (i *Infra) Destroy() error {
 	return err
 }
 
-func waitForDS(clientSet *kubernetes.Clientset) (*corev1.PodList, error) {
+func waitForDS(ctx context.Context, clientSet *kubernetes.Clientset) (*corev1.PodList, error) {
 	var podList *corev1.PodList
 	log.Info().Msgf("Waiting for DaemonSet %s/%s pods to be running", namespace.Name, dnsPerfDS.Name)
 	ds, err := clientSet.AppsV1().DaemonSets(namespace.Name).Get(context.TODO(), dnsPerfDS.Name, metav1.GetOptions{})
@@ -115,21 +123,25 @@ func waitForDS(clientSet *kubernetes.Clientset) (*corev1.PodList, error) {
 	if ds.Status.NumberReady == ds.Status.DesiredNumberScheduled {
 		return nil, err
 	}
-	// TODO handle timeout
-	watcher, err := clientSet.AppsV1().DaemonSets(namespace.Name).Watch(context.TODO(), metav1.ListOptions{TimeoutSeconds: ptr.To[int64](60)})
+	watcher, err := clientSet.AppsV1().DaemonSets(namespace.Name).Watch(ctx, metav1.ListOptions{TimeoutSeconds: ptr.To[int64](60)})
 	if err != nil {
 		return nil, err
 	}
 	for event := range watcher.ResultChan() {
-		ds := event.Object.(*appsv1.DaemonSet)
-		if event.Type == watch.Modified {
-			if ds.Status.NumberReady == ds.Status.DesiredNumberScheduled {
-				watcher.Stop()
-				break
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			ds := event.Object.(*appsv1.DaemonSet)
+			if event.Type == watch.Modified {
+				if ds.Status.NumberReady == ds.Status.DesiredNumberScheduled {
+					watcher.Stop()
+					break
+				}
 			}
 		}
 	}
-	podList, err = clientSet.CoreV1().Pods(namespace.Name).List(context.TODO(), metav1.ListOptions{
+	podList, err = clientSet.CoreV1().Pods(namespace.Name).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=" + K8sDNSPerf,
 	})
 	return podList, err
